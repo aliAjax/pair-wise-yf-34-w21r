@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 PORT = 8205
 ROLES = {"viewer", "operator", "airspace_reviewer", "commander", "auditor"}
 ACTIVE_STATUSES = {"submitted", "approved"}
+REVIEW_ROLES = {"airspace_reviewer", "commander"}
+LEDGER_ROLES = {"airspace_reviewer", "commander", "auditor"}
 
 
 class ApiError(Exception):
@@ -85,7 +87,53 @@ class Repository:
             id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL,
             detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS restriction_snapshots(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, restriction_id INTEGER NOT NULL, revision INTEGER NOT NULL,
+            snapshot_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(restriction_id,revision)
+        );
+        CREATE TABLE IF NOT EXISTS approval_ledger(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, approval_id INTEGER NOT NULL REFERENCES approvals(id),
+            plan_id INTEGER NOT NULL REFERENCES flight_plans(id), plan_revision INTEGER NOT NULL,
+            route_json TEXT NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT NOT NULL,
+            restriction_snapshot_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+            invalidation_reason_json TEXT, invalidated_by TEXT, invalidated_by_restriction_id INTEGER,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS recalc_runs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, trigger_kind TEXT NOT NULL, restriction_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, finished_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS recalc_items(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES recalc_runs(id),
+            plan_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', result_json TEXT, processed_at TEXT,
+            UNIQUE(run_id,plan_id)
+        );
         """)
+        self._migrate()
+        self._backfill()
+
+    def _migrate(self) -> None:
+        restriction_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(restrictions)")}
+        if "revision" not in restriction_cols: self.conn.execute("ALTER TABLE restrictions ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+        notification_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(notifications)")}
+        if "dedupe_key" not in notification_cols: self.conn.execute("ALTER TABLE notifications ADD COLUMN dedupe_key TEXT")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_notifications_dedupe ON notifications(plan_id,kind,dedupe_key) WHERE dedupe_key IS NOT NULL")
+
+    def _backfill(self) -> None:
+        """旧数据按当前关系回填台账：限制补快照，批准补台账行。"""
+        with self.tx() as conn:
+            for row in conn.execute("SELECT * FROM restrictions").fetchall():
+                Repository.snapshot_restriction(conn, row)
+            active_snapshot = json.dumps([dict(r) for r in conn.execute("SELECT * FROM restrictions WHERE status='active'")], ensure_ascii=False, sort_keys=True)
+            latest = {r["plan_id"]: r["mid"] for r in conn.execute("SELECT plan_id, MAX(id) mid FROM approvals WHERE decision='approved' GROUP BY plan_id")}
+            for approval in conn.execute("SELECT * FROM approvals WHERE decision='approved' ORDER BY id").fetchall():
+                if conn.execute("SELECT 1 FROM approval_ledger WHERE approval_id=?", (approval["id"],)).fetchone(): continue
+                plan = conn.execute("SELECT * FROM flight_plans WHERE id=?", (approval["plan_id"],)).fetchone()
+                if not plan: continue
+                status = "active" if plan["status"] == "approved" and latest.get(approval["plan_id"]) == approval["id"] else "superseded"
+                conn.execute("""INSERT INTO approval_ledger(approval_id,plan_id,plan_revision,route_json,starts_at,ends_at,restriction_snapshot_json,status,created_at,updated_at)
+                                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                             (approval["id"], approval["plan_id"], approval["plan_revision"], plan["route_json"], plan["starts_at"], plan["ends_at"], active_snapshot, status, approval["created_at"], iso()))
 
     @contextmanager
     def tx(self):
@@ -99,12 +147,21 @@ class Repository:
                      (plan_id, actor, role, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), iso()))
 
     @staticmethod
-    def notify(conn: sqlite3.Connection, plan_id: int, kind: str, message: str) -> None:
-        conn.execute("INSERT INTO notifications(plan_id,kind,message,created_at) VALUES(?,?,?,?)", (plan_id, kind, message, iso()))
+    def notify(conn: sqlite3.Connection, plan_id: int, kind: str, message: str, dedupe_key: str | None = None) -> None:
+        conn.execute("INSERT OR IGNORE INTO notifications(plan_id,kind,message,dedupe_key,created_at) VALUES(?,?,?,?,?)", (plan_id, kind, message, dedupe_key, iso()))
+
+    @staticmethod
+    def snapshot_restriction(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+        conn.execute("INSERT OR IGNORE INTO restriction_snapshots(restriction_id,revision,snapshot_json,created_at) VALUES(?,?,?,?)",
+                     (row["id"], row["revision"], json.dumps(dict(row), ensure_ascii=False, sort_keys=True), iso()))
 
 
 class DroneAirspaceService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path):
+        self.repo = Repository(path)
+        for run in self.repo.conn.execute("SELECT id FROM recalc_runs WHERE status IN ('pending','running') ORDER BY id").fetchall():
+            try: self._process_run(run["id"])
+            except Exception as exc: print(f"recalc run {run['id']} resume failed: {exc!r}")
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -116,21 +173,230 @@ class DroneAirspaceService:
     @staticmethod
     def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None: return dict(row) if row else None
 
-    def create_restriction(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
-        if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "restriction_forbidden", "只有空域审核员或指挥官可以维护限制")
-        name, kind, reason = str(body.get("name", "")).strip(), str(body.get("kind", "")).strip(), str(body.get("reason", "")).strip()
+    @staticmethod
+    def _restriction_fields(body: dict[str, Any], base: sqlite3.Row | None = None) -> dict[str, Any]:
+        def pick(key: str, default: Any = None) -> Any:
+            return body.get(key, base[key]) if base is not None else body.get(key, default)
+        name, kind, reason = str(pick("name", "")).strip(), str(pick("kind", "")).strip(), str(pick("reason", "")).strip()
         if kind not in {"no_fly", "temporary_limit"} or not name or not reason: raise ApiError(400, "invalid_restriction", "名称、类型和原因必填")
         try:
-            min_lon, min_lat, max_lon, max_lat = map(float, (body.get("min_lon"), body.get("min_lat"), body.get("max_lon"), body.get("max_lat")))
-            min_alt, max_alt = float(body.get("min_altitude", 0)), float(body.get("max_altitude"))
+            min_lon, min_lat, max_lon, max_lat = map(float, (pick("min_lon"), pick("min_lat"), pick("max_lon"), pick("max_lat")))
+            min_alt, max_alt = float(pick("min_altitude", 0)), float(pick("max_altitude"))
         except (TypeError, ValueError): raise ApiError(400, "invalid_restriction", "空域范围和高度必须为数字")
-        start, end = parse_time(body.get("starts_at")), parse_time(body.get("ends_at"))
+        start, end = parse_time(pick("starts_at")), parse_time(pick("ends_at"))
         if min_lon >= max_lon or min_lat >= max_lat or min_alt < 0 or max_alt <= min_alt or end <= start:
             raise ApiError(400, "invalid_restriction", "空域范围、高度或时间无效")
+        return {"name": name, "kind": kind, "reason": reason, "min_lon": min_lon, "min_lat": min_lat, "max_lon": max_lon, "max_lat": max_lat,
+                "min_altitude": min_alt, "max_altitude": max_alt, "starts_at": iso(start), "ends_at": iso(end)}
+
+    def create_restriction(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in REVIEW_ROLES: raise ApiError(403, "restriction_forbidden", "只有空域审核员或指挥官可以维护限制")
+        fields = self._restriction_fields(body)
         with self.repo.tx() as conn:
             cur = conn.execute("""INSERT INTO restrictions(name,kind,min_lon,min_lat,max_lon,max_lat,min_altitude,max_altitude,starts_at,ends_at,reason,created_at)
-                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (name, kind, min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, iso()))
-            return dict(conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone())
+                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                               (fields["name"], fields["kind"], fields["min_lon"], fields["min_lat"], fields["max_lon"], fields["max_lat"],
+                                fields["min_altitude"], fields["max_altitude"], fields["starts_at"], fields["ends_at"], fields["reason"], iso()))
+            row = conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone()
+            Repository.snapshot_restriction(conn, row)
+            Repository.audit(conn, None, actor, role, "restriction_created", {"restriction_id": row["id"], "revision": row["revision"]})
+            return dict(row)
+
+    def get_restriction(self, restriction_id: int, role: str) -> dict[str, Any]:
+        if role not in LEDGER_ROLES: raise ApiError(403, "restriction_forbidden", "当前角色不能查看限制详情")
+        row = self.repo.conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+        if not row: raise ApiError(404, "restriction_not_found", "空域限制不存在")
+        result = dict(row)
+        result["history"] = [json.loads(r["snapshot_json"]) for r in self.repo.conn.execute("SELECT * FROM restriction_snapshots WHERE restriction_id=? ORDER BY revision", (restriction_id,))]
+        return result
+
+    def revise_restriction(self, restriction_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in REVIEW_ROLES: raise ApiError(403, "restriction_forbidden", "只有空域审核员或指挥官可以维护限制")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int): raise ApiError(400, "revision_required", "expected_revision 必填")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+            if not row: raise ApiError(404, "restriction_not_found", "空域限制不存在")
+            if row["status"] != "active": raise ApiError(409, "invalid_transition", "已撤销的限制不能修改")
+            fields = self._restriction_fields(body, row)
+            cur = conn.execute("""UPDATE restrictions SET name=?,kind=?,min_lon=?,min_lat=?,max_lon=?,max_lat=?,min_altitude=?,max_altitude=?,starts_at=?,ends_at=?,reason=?,revision=revision+1
+                                  WHERE id=? AND revision=? AND status='active'""",
+                               (fields["name"], fields["kind"], fields["min_lon"], fields["min_lat"], fields["max_lon"], fields["max_lat"],
+                                fields["min_altitude"], fields["max_altitude"], fields["starts_at"], fields["ends_at"], fields["reason"], restriction_id, expected))
+            if cur.rowcount == 0: raise ApiError(409, "restriction_revision_conflict", "该限制已被其他审核员修改，请获取最新版本后重试")
+            new_row = conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+            Repository.snapshot_restriction(conn, new_row)
+            Repository.audit(conn, None, actor, role, "restriction_revised", {"restriction_id": restriction_id, "from_revision": expected, "to_revision": new_row["revision"]})
+            plan_ids = self._affected_by_change(conn, row, new_row)
+            run_id = self._start_recalc_run(conn, "restriction_revised", restriction_id, plan_ids)
+        run = self._process_run(run_id)
+        return {"restriction": dict(new_row), "recalc_run": run, "affected_plans": len(plan_ids)}
+
+    def revoke_restriction(self, restriction_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in REVIEW_ROLES: raise ApiError(403, "restriction_forbidden", "只有空域审核员或指挥官可以维护限制")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int): raise ApiError(400, "revision_required", "expected_revision 必填")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+            if not row: raise ApiError(404, "restriction_not_found", "空域限制不存在")
+            if row["status"] != "active": raise ApiError(409, "invalid_transition", "限制已撤销")
+            cur = conn.execute("UPDATE restrictions SET status='revoked',revision=revision+1 WHERE id=? AND revision=? AND status='active'", (restriction_id, expected))
+            if cur.rowcount == 0: raise ApiError(409, "restriction_revision_conflict", "该限制已被其他审核员修改，请获取最新版本后重试")
+            new_row = conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+            Repository.snapshot_restriction(conn, new_row)
+            Repository.audit(conn, None, actor, role, "restriction_revoked", {"restriction_id": restriction_id, "revision": new_row["revision"]})
+            plan_ids = self._affected_by_revoke(conn)
+            run_id = self._start_recalc_run(conn, "restriction_revoked", restriction_id, plan_ids)
+        run = self._process_run(run_id)
+        return {"restriction": dict(new_row), "recalc_run": run, "affected_plans": len(plan_ids)}
+
+    @staticmethod
+    def _intersects(plan: sqlite3.Row, restriction: sqlite3.Row) -> bool:
+        bbox = route_bbox(json.loads(plan["route_json"]))
+        rbox = (restriction["min_lon"], restriction["min_lat"], restriction["max_lon"], restriction["max_lat"])
+        if not boxes_overlap(bbox, rbox): return False
+        if not times_overlap(parse_time(plan["starts_at"]), parse_time(plan["ends_at"]), parse_time(restriction["starts_at"]), parse_time(restriction["ends_at"])): return False
+        return plan["max_altitude"] > restriction["min_altitude"] and restriction["max_altitude"] > 0
+
+    @staticmethod
+    def _latest_ledger_entries(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+        return conn.execute("""SELECT l.* FROM approval_ledger l
+                               JOIN (SELECT plan_id, MAX(id) mid FROM approval_ledger GROUP BY plan_id) latest ON latest.mid=l.id""").fetchall()
+
+    def _affected_by_change(self, conn: sqlite3.Connection, old_row: sqlite3.Row, new_row: sqlite3.Row) -> list[int]:
+        ids: set[int] = set()
+        for plan in conn.execute("SELECT * FROM flight_plans WHERE status='approved'").fetchall():
+            if self._intersects(plan, old_row) or self._intersects(plan, new_row): ids.add(plan["id"])
+        restriction_id = old_row["id"]
+        for entry in self._latest_ledger_entries(conn):
+            snapshot = json.loads(entry["restriction_snapshot_json"])
+            if entry["status"] in {"active", "restored"} and any(item.get("id") == restriction_id for item in snapshot): ids.add(entry["plan_id"])
+        for plan in conn.execute("SELECT id FROM flight_plans WHERE status='pending_review'").fetchall(): ids.add(plan["id"])
+        return sorted(ids)
+
+    @staticmethod
+    def _affected_by_revoke(conn: sqlite3.Connection) -> list[int]:
+        return sorted(r["id"] for r in conn.execute("SELECT id FROM flight_plans WHERE status='pending_review'").fetchall())
+
+    @staticmethod
+    def _start_recalc_run(conn: sqlite3.Connection, trigger_kind: str, restriction_id: int, plan_ids: list[int]) -> int:
+        cur = conn.execute("INSERT INTO recalc_runs(trigger_kind,restriction_id,status,created_at) VALUES(?,?,?,?)", (trigger_kind, restriction_id, "pending", iso()))
+        run_id = cur.lastrowid
+        for plan_id in plan_ids: conn.execute("INSERT OR IGNORE INTO recalc_items(run_id,plan_id,status) VALUES(?,?,'pending')", (run_id, plan_id))
+        return run_id
+
+    def _process_run(self, run_id: int) -> dict[str, Any]:
+        with self.repo.tx() as conn:
+            run = conn.execute("SELECT * FROM recalc_runs WHERE id=?", (run_id,)).fetchone()
+            if not run: raise ApiError(404, "recalc_not_found", "重算任务不存在")
+            if run["status"] != "done": conn.execute("UPDATE recalc_runs SET status='running' WHERE id=?", (run_id,))
+        if run["status"] == "done": return self._run_report(run_id)
+        try:
+            while True:
+                with self.repo.tx() as conn:
+                    item = conn.execute("SELECT * FROM recalc_items WHERE run_id=? AND status!='done' ORDER BY id LIMIT 1", (run_id,)).fetchone()
+                if not item: break
+                try:
+                    with self.repo.tx() as conn:
+                        result = self._recalc_plan(conn, dict(run), item["plan_id"])
+                        conn.execute("UPDATE recalc_items SET status='done',result_json=?,processed_at=? WHERE id=?", (json.dumps(result, ensure_ascii=False), iso(), item["id"]))
+                except Exception as exc:
+                    with self.repo.tx() as conn:
+                        conn.execute("UPDATE recalc_items SET status='failed',result_json=?,processed_at=? WHERE id=?", (json.dumps({"error": repr(exc)}, ensure_ascii=False), iso(), item["id"]))
+                    raise
+            with self.repo.tx() as conn:
+                conn.execute("UPDATE recalc_runs SET status='done',finished_at=? WHERE id=?", (iso(), run_id))
+        except Exception:
+            with self.repo.tx() as conn:
+                conn.execute("UPDATE recalc_runs SET status='failed',finished_at=? WHERE id=?", (iso(), run_id))
+            raise
+        return self._run_report(run_id)
+
+    def _run_report(self, run_id: int) -> dict[str, Any]:
+        conn = self.repo.conn
+        run = dict(conn.execute("SELECT * FROM recalc_runs WHERE id=?", (run_id,)).fetchone())
+        items = []
+        for item in conn.execute("SELECT * FROM recalc_items WHERE run_id=? ORDER BY id", (run_id,)):
+            entry = dict(item); entry["result"] = json.loads(entry.pop("result_json")) if entry["result_json"] else None; items.append(entry)
+        run["items"] = items
+        return run
+
+    @staticmethod
+    def _describe_blockers(report: dict[str, Any]) -> str:
+        parts = [item["message"] for item in report["hard_violations"]]
+        for item in report["blocking_conflicts"]:
+            if item["code"] == "airspace_restriction": parts.append(f"空域限制#{item['restriction_id']}「{item['name']}」：{item['reason']}")
+            elif item["code"] == "adjacent_traffic": parts.append("相邻航路与有效计划重叠")
+            else: parts.append(item["message"])
+        return "；".join(parts) or "无"
+
+    def _recalc_plan(self, conn: sqlite3.Connection, run: dict[str, Any], plan_id: int) -> dict[str, Any]:
+        plan = self._plan_row(conn, plan_id)
+        restriction_id = run["restriction_id"]
+        entry = conn.execute("SELECT * FROM approval_ledger WHERE plan_id=? ORDER BY id DESC LIMIT 1", (plan_id,)).fetchone()
+        if plan["status"] == "approved":
+            report = self._conflict_report(conn, plan)
+            if report["approvable"]: return {"result": "still_valid"}
+            reason = {"hard_violations": report["hard_violations"], "blocking_conflicts": report["blocking_conflicts"]}
+            if entry and entry["status"] in {"active", "restored"}:
+                conn.execute("""UPDATE approval_ledger SET status='invalidated',invalidation_reason_json=?,invalidated_by=?,invalidated_by_restriction_id=?,updated_at=? WHERE id=?""",
+                             (json.dumps(reason, ensure_ascii=False), f"restriction#{restriction_id} {run['trigger_kind']}", restriction_id, iso(), entry["id"]))
+            conn.execute("UPDATE flight_plans SET status='pending_review',updated_at=? WHERE id=?", (iso(), plan_id))
+            Repository.audit(conn, plan_id, "system", "system", "approval_invalidated_by_restriction", {"restriction_id": restriction_id, "run_id": run["id"], "reason": reason})
+            Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 因空域限制变更批准失效，转待复核，扣在：{self._describe_blockers(report)}", dedupe_key=f"run:{run['id']}:invalidated")
+            return {"result": "invalidated", "reason": reason}
+        if plan["status"] == "pending_review" and entry and entry["status"] == "invalidated":
+            unchanged = (plan["revision"] == entry["plan_revision"] and plan["route_json"] == entry["route_json"]
+                         and plan["starts_at"] == entry["starts_at"] and plan["ends_at"] == entry["ends_at"])
+            if not unchanged:
+                Repository.notify(conn, plan_id, "re_review_required", f"飞行计划 {plan['callsign']} 在批准后变更过版本、航线或时间，不能自动恢复，请重新提交审核", dedupe_key=f"run:{run['id']}:rereview")
+                return {"result": "changed_requires_rereview"}
+            report = self._conflict_report(conn, plan)
+            if report["approvable"]:
+                conn.execute("UPDATE approval_ledger SET status='restored',invalidation_reason_json=NULL,updated_at=? WHERE id=?", (iso(), entry["id"]))
+                conn.execute("UPDATE flight_plans SET status='approved',updated_at=? WHERE id=?", (iso(), plan_id))
+                Repository.audit(conn, plan_id, "system", "system", "approval_restored", {"restriction_id": restriction_id, "run_id": run["id"]})
+                Repository.notify(conn, plan_id, "approval_restored", f"飞行计划 {plan['callsign']} 的空域限制已撤销，版本、航线和时间均未变化，批准自动恢复", dedupe_key=f"run:{run['id']}:restored")
+                return {"result": "restored"}
+            reason = {"hard_violations": report["hard_violations"], "blocking_conflicts": report["blocking_conflicts"]}
+            conn.execute("UPDATE approval_ledger SET invalidation_reason_json=?,updated_at=? WHERE id=?", (json.dumps(reason, ensure_ascii=False), iso(), entry["id"]))
+            Repository.notify(conn, plan_id, "still_blocked", f"飞行计划 {plan['callsign']} 复核仍未通过，扣在：{self._describe_blockers(report)}", dedupe_key=f"run:{run['id']}:blocked")
+            return {"result": "still_blocked", "reason": reason}
+        return {"result": "skipped"}
+
+    def retry_recalc(self, run_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role not in REVIEW_ROLES: raise ApiError(403, "recalc_forbidden", "只有空域审核员或指挥官可以重试重算任务")
+        run = self._process_run(run_id)
+        with self.repo.tx() as conn:
+            Repository.audit(conn, None, actor, role, "recalc_retried", {"run_id": run_id, "status": run["status"]})
+        return {"recalc_run": run}
+
+    def recalc_runs(self, role: str) -> dict[str, Any]:
+        if role not in LEDGER_ROLES: raise ApiError(403, "recalc_forbidden", "当前角色不能查看重算任务")
+        return {"runs": [self._run_report(r["id"]) for r in self.repo.conn.execute("SELECT id FROM recalc_runs ORDER BY id DESC").fetchall()]}
+
+    @staticmethod
+    def _ledger_dict(row: sqlite3.Row) -> dict[str, Any]:
+        entry = dict(row)
+        entry["route"] = json.loads(entry.pop("route_json"))
+        entry["restriction_snapshot"] = json.loads(entry.pop("restriction_snapshot_json"))
+        entry["invalidation_reason"] = json.loads(entry.pop("invalidation_reason_json")) if entry["invalidation_reason_json"] else None
+        return entry
+
+    def ledger(self, role: str, operator: str, plan_id: int | None = None) -> dict[str, Any]:
+        conn = self.repo.conn
+        if plan_id is not None:
+            plan = self._plan_row(conn, plan_id)
+            if role == "operator":
+                if plan["operator_id"] != operator: raise ApiError(403, "plan_forbidden", "不能查看其他运营方计划")
+            elif role not in LEDGER_ROLES: raise ApiError(403, "ledger_forbidden", "当前角色不能查看台账")
+            rows = conn.execute("SELECT * FROM approval_ledger WHERE plan_id=? ORDER BY id DESC", (plan_id,))
+        elif role == "operator":
+            rows = conn.execute("SELECT l.* FROM approval_ledger l JOIN flight_plans p ON p.id=l.plan_id WHERE p.operator_id=? ORDER BY l.id DESC", (operator,))
+        elif role in LEDGER_ROLES:
+            rows = conn.execute("SELECT * FROM approval_ledger ORDER BY id DESC")
+        else: raise ApiError(403, "ledger_forbidden", "当前角色不能查看台账")
+        return {"ledger": [self._ledger_dict(r) for r in rows]}
 
     def create_plan(self, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "operator": raise ApiError(403, "plan_forbidden", "只有运营方可以创建飞行计划")
@@ -196,6 +462,7 @@ class DroneAirspaceService:
         if role == "viewer":
             result = {key: result[key] for key in ("id", "callsign", "starts_at", "ends_at", "max_altitude", "region", "status", "valid_until" if "valid_until" in result else "updated_at")}
         if role in {"airspace_reviewer", "commander", "auditor"}: result["approvals"] = [dict(r) for r in conn.execute("SELECT * FROM approvals WHERE plan_id=? ORDER BY id", (plan_id,))]
+        if role != "viewer": result["ledger"] = [self._ledger_dict(r) for r in conn.execute("SELECT * FROM approval_ledger WHERE plan_id=? ORDER BY id DESC", (plan_id,))]
         return result
 
     def submit(self, plan_id: int, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -204,7 +471,7 @@ class DroneAirspaceService:
             plan = self._plan_row(conn, plan_id)
             if plan["operator_id"] != operator: raise ApiError(403, "plan_forbidden", "不能提交其他运营方计划")
             if plan["status"] == "submitted": return {"plan": self.get_plan(plan_id, role, operator), "idempotent": True}
-            if plan["status"] not in {"draft", "rejected"}: raise ApiError(409, "invalid_transition", "当前状态不能提交")
+            if plan["status"] not in {"draft", "rejected", "pending_review"}: raise ApiError(409, "invalid_transition", "当前状态不能提交")
             if parse_time(plan["starts_at"]) <= utcnow(): raise ApiError(409, "plan_expired", "计划起飞时间已过")
             conn.execute("UPDATE flight_plans SET status='submitted',updated_at=? WHERE id=?", (iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_submitted", {"revision": plan["revision"]})
@@ -232,11 +499,16 @@ class DroneAirspaceService:
             override_kind = "emergency_authority" if report["blocking_conflicts"] else None
             cur = conn.execute("""INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,override_kind,created_at)
                                   VALUES(?,?,?,?,?,?,?,?)""", (plan_id, expected, actor, "approved", reason, offline_id, override_kind, iso()))
+            approval_id = cur.lastrowid
+            snapshot = json.dumps([dict(r) for r in conn.execute("SELECT * FROM restrictions WHERE status='active'")], ensure_ascii=False, sort_keys=True)
+            conn.execute("UPDATE approval_ledger SET status='superseded',updated_at=? WHERE plan_id=? AND status IN ('active','invalidated','restored')", (iso(), plan_id))
+            conn.execute("""INSERT INTO approval_ledger(approval_id,plan_id,plan_revision,route_json,starts_at,ends_at,restriction_snapshot_json,status,created_at,updated_at)
+                            VALUES(?,?,?,?,?,?,?,'active',?,?)""", (approval_id, plan_id, expected, plan["route_json"], plan["starts_at"], plan["ends_at"], snapshot, iso(), iso()))
             conn.execute("UPDATE flight_plans SET status='approved',updated_at=? WHERE id=?", (iso(), plan_id))
             if override_kind: Repository.audit(conn, plan_id, actor, role, "emergency_override_used", {"override_reason": override, "conflicts": report["blocking_conflicts"]})
             Repository.audit(conn, plan_id, actor, role, "plan_approved", {"revision": expected, "offline_id": offline_id})
             Repository.notify(conn, plan_id, "approved", f"飞行计划 {plan['callsign']} 已批准")
-            return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False, "approval_id": cur.lastrowid, "override_kind": override_kind}
+            return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False, "approval_id": approval_id, "override_kind": override_kind}
 
     def reject(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "review_forbidden", "当前角色不能拒绝计划")
@@ -274,7 +546,12 @@ class DroneAirspaceService:
             conn.execute("""UPDATE flight_plans SET route_json=?,starts_at=?,ends_at=?,payload_kg=?,max_altitude=?,population_risk=?,emergency_plan=?,region=?,status='draft',revision=?,updated_at=? WHERE id=?""",
                          (json.dumps(route), iso(start), iso(end), payload, altitude, risk, body.get("emergency_plan", plan["emergency_plan"]), body.get("region", plan["region"]), revision, iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"]})
-            if plan["status"] == "approved": Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效")
+            if plan["status"] == "approved":
+                entry = conn.execute("SELECT * FROM approval_ledger WHERE plan_id=? ORDER BY id DESC LIMIT 1", (plan_id,)).fetchone()
+                if entry and entry["status"] in {"active", "restored"}:
+                    reason = {"blocking_conflicts": [{"code": "plan_changed", "message": f"计划已变更，版本 {expected} → {revision}"}]}
+                    conn.execute("UPDATE approval_ledger SET status='invalidated',invalidation_reason_json=?,invalidated_by='plan_change',updated_at=? WHERE id=?", (json.dumps(reason, ensure_ascii=False), iso(), entry["id"]))
+                Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效", dedupe_key=f"plan:{plan_id}:rev:{revision}")
             else: Repository.notify(conn, plan_id, "changed", f"飞行计划 {plan['callsign']} 已更新，需重新提交审核")
             return self.get_plan(plan_id, role, operator)
 
@@ -288,6 +565,7 @@ class DroneAirspaceService:
             if plan["status"] == "canceled": return {"plan": self.get_plan(plan_id, role, operator), "idempotent": True}
             if plan["status"] == "expired": raise ApiError(409, "plan_expired", "已过期计划不能取消")
             conn.execute("UPDATE flight_plans SET status='canceled',updated_at=? WHERE id=?", (iso(), plan_id))
+            conn.execute("UPDATE approval_ledger SET status='closed',updated_at=? WHERE plan_id=? AND status IN ('active','restored')", (iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_canceled", {"reason": reason})
             Repository.notify(conn, plan_id, "canceled", f"飞行计划 {plan['callsign']} 已取消：{reason}")
             return {"plan": self.get_plan(plan_id, role, operator), "idempotent": False}
@@ -306,6 +584,7 @@ class DroneAirspaceService:
             rows = list(conn.execute("SELECT * FROM flight_plans WHERE status='approved' AND ends_at<=?", (now,)))
             for row in rows:
                 conn.execute("UPDATE flight_plans SET status='expired',updated_at=? WHERE id=?", (now, row["id"]))
+                conn.execute("UPDATE approval_ledger SET status='closed',updated_at=? WHERE plan_id=? AND status IN ('active','restored')", (now, row["id"]))
                 Repository.audit(conn, row["id"], actor, role, "plan_expired", {})
                 Repository.notify(conn, row["id"], "expired", f"飞行计划 {row['callsign']} 已过期")
         return {"expired": len(rows)}
@@ -341,15 +620,24 @@ class Handler(BaseHTTPRequestHandler):
         actor, role, operator = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, operator)
         if path == "/api/notifications": return 200, self.service.notifications(actor, role, operator)
+        if path == "/api/ledger": return 200, self.service.ledger(role, operator)
+        if path == "/api/recalc": return 200, self.service.recalc_runs(role)
         parts = [p for p in path.split("/") if p]
+        if len(parts) == 3 and parts[:2] == ["api", "restrictions"] and parts[2].isdigit(): return 200, self.service.get_restriction(int(parts[2]), role)
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]), role, operator)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "check": return 200, self.service.check_conflicts(int(parts[2]), role, operator)
+        if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "ledger": return 200, self.service.ledger(role, operator, int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, operator = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
         if path == "/api/restrictions": return 201, self.service.create_restriction(actor, role, body)
         if path == "/api/plans": return 201, self.service.create_plan(actor, role, operator, body)
         if path == "/api/expire": return 200, self.service.expire_plans(actor, role)
+        if len(parts) == 4 and parts[:2] == ["api", "restrictions"] and parts[2].isdigit():
+            rid, action = int(parts[2]), parts[3]
+            if action == "revise": return 200, self.service.revise_restriction(rid, actor, role, body)
+            if action == "revoke": return 200, self.service.revoke_restriction(rid, actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "recalc"] and parts[2].isdigit() and parts[3] == "retry": return 200, self.service.retry_recalc(int(parts[2]), actor, role)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
             pid, action = int(parts[2]), parts[3]
             routes = {
